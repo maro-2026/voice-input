@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>音声で数値入力</title>
+<style>
+  body {
+    font-family: Arial, sans-serif;
+    max-width: 420px;
+    margin: 30px auto;
+    padding: 0 16px;
+    font-size: 14px;
+  }
+  h2 { font-size: 18px; }
+  label { display:block; margin-top: 10px; font-weight: bold; }
+  select, input {
+    width: 100%;
+    padding: 8px;
+    margin-top: 4px;
+    box-sizing: border-box;
+    font-size: 14px;
+  }
+  button {
+    width: 100%;
+    padding: 12px;
+    margin-top: 14px;
+    font-size: 15px;
+    border-radius: 6px;
+    border: none;
+    cursor: pointer;
+  }
+  #startBtn { background: #1a73e8; color: white; }
+  #stopBtn { background: #ea4335; color: white; }
+  #stopBtn:disabled, #startBtn:disabled { opacity: 0.5; cursor: default; }
+  .status {
+    margin: 14px 0;
+    padding: 10px;
+    border-radius: 6px;
+    background: #f1f3f4;
+  }
+  .listening { background: #e6f4ea; color: #188038; }
+  .log {
+    margin-top: 12px;
+    max-height: 260px;
+    overflow-y: auto;
+    font-size: 12px;
+    color: #555;
+  }
+  .log div { padding: 4px 0; border-bottom: 1px solid #eee; }
+  .cell-label { font-weight: bold; color: #1a73e8; }
+  .config {
+    background: #fff8e1;
+    padding: 10px;
+    border-radius: 6px;
+    margin-bottom: 10px;
+    font-size: 12px;
+  }
+</style>
+</head>
+<body>
+
+<h2>🎤 音声で数値入力</h2>
+
+<div class="config">
+  ⚙️ 初回だけ、下の「設定」欄にApps ScriptのWebアプリURLを入力してください。
+</div>
+
+<label>WebアプリURL (…/exec で終わるもの)</label>
+<input id="webAppUrl" type="text" placeholder="https://script.google.com/macros/s/.../exec">
+
+<label>合言葉 (Code.gsのSECRETと同じ値)</label>
+<input id="secretInput" type="text" placeholder="my-voice-input-2026">
+
+<label>シート名</label>
+<input id="sheetName" type="text" placeholder="例: シート1" value="シート1">
+
+<label>入力を開始するセル (例: B2)</label>
+<input id="startCell" type="text" value="B2">
+
+<div class="config">
+  💬「バック」＝1つ前に戻る／「チェック」＝左セルの値を読み上げ／「停止」＝一時停止(「開始」と言うまで数字を無視)
+</div>
+
+<label style="display:flex; align-items:center; gap:6px; font-weight:normal;">
+  <input id="headphoneMode" type="checkbox" style="width:auto;">
+  イヤホン/ヘッドセット使用中(読み上げ中もマイクを止めない・テンポ優先)
+</label>
+
+<button id="startBtn">開始</button>
+<button id="stopBtn" disabled>■ 停止</button>
+
+<div id="status" class="status">待機中です</div>
+<div>次に入力されるセル: <span id="currentCell" class="cell-label">-</span></div>
+
+<div class="log" id="log"></div>
+
+<script>
+  let recognition = null;
+  let shouldRestart = false;
+  let pauseForSpeech = false;
+  let currentRow = 0;
+  let currentCol = '';
+
+  // 合言葉・URLはファイルに書き込まず、入力欄から読み取る(公開リポジトリでも安全なように)
+  const webAppUrlInput = document.getElementById('webAppUrl');
+  const secretInput = document.getElementById('secretInput');
+  const sheetNameInput = document.getElementById('sheetName');
+  const startCellInput = document.getElementById('startCell');
+  const headphoneModeInput = document.getElementById('headphoneMode');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const statusEl = document.getElementById('status');
+  const currentCellEl = document.getElementById('currentCell');
+  const logEl = document.getElementById('log');
+
+  // 前回入力したURLなどを覚えておく(このパソコン内だけ)
+  webAppUrlInput.value = localStorage.getItem('voiceInputWebAppUrl') || '';
+  sheetNameInput.value = localStorage.getItem('voiceInputSheetName') || 'シート1';
+  secretInput.value = localStorage.getItem('voiceInputSecret') || '';
+
+  function log(msg) {
+    const line = document.createElement('div');
+    line.textContent = msg;
+    logEl.insertBefore(line, logEl.firstChild);
+  }
+
+  // 列文字(A,B,C...)を数値に変換
+  function colToNum(col) {
+    let num = 0;
+    for (let i = 0; i < col.length; i++) {
+      num = num * 26 + (col.charCodeAt(i) - 64);
+    }
+    return num;
+  }
+  // 数値を列文字(A,B,C...)に変換
+  function numToCol(num) {
+    let col = '';
+    while (num > 0) {
+      const rem = (num - 1) % 26;
+      col = String.fromCharCode(65 + rem) + col;
+      num = Math.floor((num - 1) / 26);
+    }
+    return col;
+  }
+
+  // 音声合成で読み上げる(終わるまで待てるようPromiseにする)
+  function speak(text) {
+    return new Promise(function(resolve) {
+      if (!window.speechSynthesis || !text) { resolve(); return; }
+      window.speechSynthesis.cancel(); // 前の読み上げが残っていたら止める
+      const utter = new SpeechSynthesisUtterance(String(text));
+      utter.lang = 'ja-JP';
+      utter.rate = 1.35; // 少し速めに読み上げてテンポを上げる
+      utter.onend = resolve;
+      utter.onerror = resolve;
+      window.speechSynthesis.speak(utter);
+    });
+  }
+
+  // 現在の行の「1つ左のセル」の値を取得する
+  function fetchLeftCellValue(row) {
+    const leftColNum = colToNum(currentCol) - 1;
+    if (leftColNum < 1) return Promise.resolve(null); // 左に列がない(A列など)
+    const leftCol = numToCol(leftColNum);
+    const url = webAppUrlInput.value.trim()
+      + '?action=read&secret=' + encodeURIComponent(secretInput.value.trim())
+      + '&sheetName=' + encodeURIComponent(sheetNameInput.value.trim())
+      + '&cell=' + encodeURIComponent(leftCol + row);
+    return fetch(url)
+      .then(function(res) { return res.json(); })
+      .then(function(data) { return data.status === 'ok' ? data.value : null; })
+      .catch(function() { return null; });
+  }
+
+  // 左セルの値を読み上げてから完了する(セルが空なら即完了)
+  function announceLeftCellThen(row) {
+    return fetchLeftCellValue(row).then(function(value) {
+      if (value === null || value === '') {
+        log('🔊 左セルは空です');
+        return;
+      }
+      log('🔊 読み上げ: 次' + value);
+      return speak('次' + value);
+    });
+  }
+
+  function setStatus(text, listening) {
+    statusEl.textContent = text;
+    statusEl.className = 'status' + (listening ? ' listening' : '');
+  }
+
+  // 認識時のビープ音
+  let audioCtx = null;
+  function playBeep(freq, duration) {
+    try {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.frequency.value = freq;
+      osc.type = 'sine';
+      gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start();
+      osc.stop(audioCtx.currentTime + duration);
+    } catch (e) { /* 音が鳴らせなくても処理は継続 */ }
+  }
+
+  function parseA1(a1) {
+    const m = a1.trim().toUpperCase().match(/^([A-Z]+)(\d+)$/);
+    if (!m) return null;
+    return { col: m[1], row: parseInt(m[2], 10) };
+  }
+
+  function updateCurrentCellDisplay() {
+    currentCellEl.textContent = currentCol + currentRow;
+  }
+
+  // 一文字の数字読み → 0〜9
+  const KANJI_DIGIT = {
+    'ゼロ':0,'れい':0,'零':0,'〇':0,
+    'いち':1,'一':1,
+    'に':2,'二':2,
+    'さん':3,'三':3,
+    'よん':4,'し':4,'四':4,
+    'ご':5,'五':5,
+    'ろく':6,'六':6,
+    'なな':7,'しち':7,'七':7,
+    'はち':8,'八':8,
+    'きゅう':9,'く':9,'九':9
+  };
+  // 位取り
+  const KANJI_SMALL_UNIT = { '十':10, 'じゅう':10, '百':100, 'ひゃく':100, '千':1000, 'せん':1000 };
+  const KANJI_BIG_UNIT = { '万':10000, 'まん':10000, '億':100000000, 'おく':100000000 };
+
+  // 「二十二」「三百五」「二万三千」のような、まとめ読みの漢数字を数値に変換する
+  function kanjiToNumber(str) {
+    if (!str) return null;
+
+    // 読みやすいよう長いキーから順にトークン化する
+    const allKeys = Object.keys(KANJI_DIGIT).concat(Object.keys(KANJI_SMALL_UNIT), Object.keys(KANJI_BIG_UNIT))
+      .sort((a, b) => b.length - a.length);
+
+    let tokens = [];
+    let rest = str;
+    while (rest.length > 0) {
+      let matched = false;
+      for (const k of allKeys) {
+        if (rest.startsWith(k)) {
+          tokens.push(k);
+          rest = rest.slice(k.length);
+          matched = true;
+          break;
+        }
+      }
+      if (!matched) rest = rest.slice(1); // 認識できない文字は読み飛ばす
+    }
+    if (tokens.length === 0) return null;
+
+    let total = 0, section = 0, number = 0, hasAny = false;
+    for (const tok of tokens) {
+      if (tok in KANJI_DIGIT) {
+        number = KANJI_DIGIT[tok];
+        hasAny = true;
+      } else if (tok in KANJI_SMALL_UNIT) {
+        section += (number === 0 ? 1 : number) * KANJI_SMALL_UNIT[tok];
+        number = 0;
+        hasAny = true;
+      } else if (tok in KANJI_BIG_UNIT) {
+        section = (section + number) * KANJI_BIG_UNIT[tok];
+        total += section;
+        section = 0;
+        number = 0;
+        hasAny = true;
+      }
+    }
+    total += section + number;
+    return hasAny ? total : null;
+  }
+
+  function parseNumberFromText(text) {
+    let t = text.trim();
+    let negative = /マイナス|ー(?=\d)/.test(t);
+    t = t.replace(/マイナス/g, '');
+
+    t = t.replace(/[０-９]/g, function(ch) {
+      return String.fromCharCode(ch.charCodeAt(0) - 0xFEE0);
+    });
+
+    // Chromeが直接「12」のような数字表記を返すケース(かなり多い)を最優先
+    let match = t.match(/\d+(\.\d+)?/);
+    if (match) {
+      let v = parseFloat(match[0]);
+      if (negative) v = -v;
+      return v;
+    }
+
+    // 「〜点〜」「〜てん〜」で小数を表しているケース
+    // (小数点以下は1桁ずつ読むのが一般的: 「さんてんいちよん」→3.14)
+    const tenMatch = t.match(/(.*)(?:点|てん)(.*)/);
+    if (tenMatch) {
+      const intPart = kanjiToNumber(tenMatch[1]);
+      let fracDigits = '';
+      let fracRest = tenMatch[2];
+      const singleDigitKeys = Object.keys(KANJI_DIGIT).sort((a, b) => b.length - a.length);
+      while (fracRest.length > 0) {
+        let matched = false;
+        for (const k of singleDigitKeys) {
+          if (fracRest.startsWith(k)) {
+            fracDigits += String(KANJI_DIGIT[k]);
+            fracRest = fracRest.slice(k.length);
+            matched = true;
+            break;
+          }
+        }
+        if (!matched) fracRest = fracRest.slice(1);
+      }
+      if (intPart !== null || fracDigits.length > 0) {
+        let v = parseFloat((intPart !== null ? intPart : 0) + '.' + (fracDigits || '0'));
+        if (!isNaN(v)) {
+          if (negative) v = -v;
+          return v;
+        }
+      }
+    }
+
+    // まとめ読みの漢数字(十・百・千・万を含む)
+    const kanjiVal = kanjiToNumber(t);
+    if (kanjiVal !== null) {
+      return negative ? -kanjiVal : kanjiVal;
+    }
+
+    return null;
+  }
+
+  function sendToSheet(sheetName, cell, value) {
+    const url = webAppUrlInput.value.trim();
+    return fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' }, // preflight回避のためtext/plainにする
+      body: JSON.stringify({ secret: secretInput.value.trim(), sheetName: sheetName, cell: cell, value: value })
+    }).then(function(res) { return res.json(); });
+  }
+
+  // 「戻る」系の言葉かどうかを判定する
+  const CORRECTION_KEYWORDS = ['バック', 'ばっく'];
+  function isCorrectionCommand(text) {
+    return CORRECTION_KEYWORDS.some(function(k) { return text.includes(k); });
+  }
+
+  // 戻る操作を示す音(下がる2音)
+  function playCorrectionBeep() {
+    playBeep(600, 0.12);
+    setTimeout(function() { playBeep(400, 0.15); }, 130);
+  }
+
+  let startRow = 0; // これより前には戻れない
+
+  function handleCorrection(transcript) {
+    if (currentRow <= startRow) {
+      log('⚠ "' + transcript + '" → これ以上は戻れません(開始セルです)');
+      if (headphoneModeInput.checked) {
+        speak('これ以上戻れません');
+      } else {
+        pauseForSpeech = true;
+        recognition.stop();
+        speak('これ以上戻れません').then(function() {
+          pauseForSpeech = false;
+          try { recognition.start(); } catch (e) { /* 多重start対策 */ }
+        });
+      }
+      return;
+    }
+
+    currentRow -= 1;
+    updateCurrentCellDisplay();
+    log('↩ "' + transcript + '" → ' + currentCol + currentRow + ' に戻りました(次の数字で上書きされます)');
+
+    if (headphoneModeInput.checked) {
+      speak('バックしました');
+    } else {
+      pauseForSpeech = true;
+      recognition.stop();
+      speak('バックしました').then(function() {
+        pauseForSpeech = false;
+        try { recognition.start(); } catch (e) { /* 多重start対策 */ }
+      });
+    }
+  }
+
+  // 「チェック」系の言葉かどうかを判定する
+  const CONFIRM_KEYWORDS = ['チェック'];
+  function isConfirmCommand(text) {
+    return CONFIRM_KEYWORDS.some(function(k) { return text.includes(k); });
+  }
+
+  // 「停止」系の言葉かどうかを判定する(完全終了ではなく一時停止)
+  const PAUSE_KEYWORDS = ['停止'];
+  function isPauseCommand(text) {
+    return PAUSE_KEYWORDS.some(function(k) { return text.includes(k); });
+  }
+
+  // 「開始」系の言葉かどうかを判定する(一時停止からの再開)
+  const RESUME_KEYWORDS = ['開始'];
+  function isResumeCommand(text) {
+    return RESUME_KEYWORDS.some(function(k) { return text.includes(k); });
+  }
+
+  let isPaused = false;
+
+  function handlePause(transcript) {
+    isPaused = true;
+    log('⏸ "' + transcript + '" → 一時停止します(「開始」と言うまで数字は無視されます)');
+    setStatus('⏸ 一時停止中... 「開始」で再開します', false);
+    speakWithPause('一時停止しました');
+  }
+
+  function handleResume(transcript) {
+    isPaused = false;
+    log('▶ "' + transcript + '" → 再開します');
+    setStatus('🎤 聞き取り中... 数字を話してください', true);
+    speakWithPause('再開しました');
+  }
+
+  // ヘッドホンモードでなければマイクを止めてから読み上げ、終わったら再開する共通処理
+  function speakWithPause(text) {
+    if (headphoneModeInput.checked) {
+      speak(text);
+    } else {
+      pauseForSpeech = true;
+      recognition.stop();
+      speak(text).then(function() {
+        pauseForSpeech = false;
+        try { recognition.start(); } catch (e) { /* 多重start対策 */ }
+      });
+    }
+  }
+
+  function handleConfirm(transcript) {
+    log('❓ "' + transcript + '" → 左セルを確認します');
+    if (headphoneModeInput.checked) {
+      announceLeftCellThen(currentRow);
+    } else {
+      pauseForSpeech = true;
+      recognition.stop();
+      announceLeftCellThen(currentRow).then(function() {
+        pauseForSpeech = false;
+        try { recognition.start(); } catch (e) { /* 多重start対策 */ }
+      });
+    }
+  }
+
+  function initRecognition() {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      setStatus('このブラウザは音声認識に対応していません(Chrome推奨)', false);
+      return null;
+    }
+    const r = new SpeechRecognition();
+    r.lang = 'ja-JP';
+    r.continuous = true;       // 隙間なく聞き続ける(取りこぼし防止)
+    r.interimResults = false;
+    r.maxAlternatives = 3;     // 候補を複数チェックして数字が拾える確率を上げる
+
+    r.onresult = function(event) {
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i];
+        if (!result.isFinal) continue;
+
+        // 一時停止中は「開始」だけを探し、それ以外は完全に無視する(ログもビープも出さない)
+        if (isPaused) {
+          let resumeTranscript = null;
+          for (let j = 0; j < result.length; j++) {
+            if (isResumeCommand(result[j].transcript)) {
+              resumeTranscript = result[j].transcript;
+              break;
+            }
+          }
+          if (resumeTranscript !== null) {
+            handleResume(resumeTranscript);
+          }
+          continue; // 一時停止中はここで終わり(数字判定などは一切しない)
+        }
+
+        // 「停止」コマンドを最優先でチェック
+        let pauseTranscript = null;
+        for (let j = 0; j < result.length; j++) {
+          if (isPauseCommand(result[j].transcript)) {
+            pauseTranscript = result[j].transcript;
+            break;
+          }
+        }
+
+        if (pauseTranscript !== null) {
+          handlePause(pauseTranscript);
+          continue;
+        }
+
+        // まず「戻る」系のコマンドが含まれていないか、候補を全部チェック
+        let correctionTranscript = null;
+        for (let j = 0; j < result.length; j++) {
+          if (isCorrectionCommand(result[j].transcript)) {
+            correctionTranscript = result[j].transcript;
+            break;
+          }
+        }
+
+        if (correctionTranscript !== null) {
+          handleCorrection(correctionTranscript);
+          continue;
+        }
+
+        // 次に「チェック」系のコマンドが含まれていないか確認
+        let confirmTranscript = null;
+        for (let j = 0; j < result.length; j++) {
+          if (isConfirmCommand(result[j].transcript)) {
+            confirmTranscript = result[j].transcript;
+            break;
+          }
+        }
+
+        if (confirmTranscript !== null) {
+          handleConfirm(confirmTranscript);
+          continue;
+        }
+
+        let value = null;
+        let usedTranscript = result[0].transcript;
+
+        // 第1候補がダメでも、第2・第3候補に数字があれば採用する
+        for (let j = 0; j < result.length; j++) {
+          const candidate = result[j].transcript;
+          const parsed = parseNumberFromText(candidate);
+          if (parsed !== null) {
+            value = parsed;
+            usedTranscript = candidate;
+            break;
+          }
+        }
+
+        if (value === null) {
+          log('❓ 認識: "' + usedTranscript + '" → 数値を検出できませんでした');
+          playBeep(220, 0.25); // 低い音: 聞き取れたが数字ではなかった
+          continue;
+        }
+
+        const targetCell = currentCol + currentRow;
+        log('… "' + usedTranscript + '" → ' + targetCell + ' に ' + value + ' を送信中');
+
+        sendToSheet(sheetNameInput.value.trim(), targetCell, value)
+          .then(function(res) {
+            if (res.status === 'ok') {
+              log('✅ ' + targetCell + ' に ' + value + ' を書き込みました');
+              playBeep(880, 0.15); // 高い音: 書き込み成功
+              currentRow += 1;
+              updateCurrentCellDisplay();
+
+              // 入力した数字自体を読み上げて確認する
+              if (headphoneModeInput.checked) {
+                speak(String(value));
+              } else {
+                pauseForSpeech = true;
+                recognition.stop();
+                speak(String(value)).then(function() {
+                  pauseForSpeech = false;
+                  try { recognition.start(); } catch (e) { /* 多重start対策 */ }
+                });
+              }
+            } else {
+              log('⚠ 書き込み失敗: ' + res.message);
+            }
+          })
+          .catch(function(err) {
+            log('⚠ 通信エラー: ' + err.message);
+          });
+      }
+    };
+
+    let hadFatalError = false;
+
+    r.onerror = function(event) {
+      console.error('SpeechRecognition error:', event.error);
+      log('⚠ エラー詳細: ' + event.error);
+
+      if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+        hadFatalError = true;
+        shouldRestart = false;
+        setStatus('⚠ マイクが許可されていません(' + event.error + ')', false);
+      } else if (event.error !== 'no-speech' && event.error !== 'aborted') {
+        hadFatalError = true;
+        shouldRestart = false;
+      }
+    };
+
+    r.onend = function() {
+      if (pauseForSpeech) return; // 読み上げのために意図的に止めた場合は、読み上げ完了後に自前で再開する
+      if (shouldRestart) {
+        try { r.start(); } catch (e) { log('再開失敗: ' + e.message); }
+      } else if (!hadFatalError) {
+        setStatus('停止しました', false);
+      }
+    };
+
+    return r;
+  }
+
+  startBtn.addEventListener('click', function() {
+    if (!webAppUrlInput.value.trim()) {
+      alert('WebアプリURLを入力してください');
+      return;
+    }
+    if (!secretInput.value.trim()) {
+      alert('合言葉を入力してください(Code.gsのSECRETと同じ値)');
+      return;
+    }
+    const parsed = parseA1(startCellInput.value);
+    if (!parsed) {
+      alert('セル指定が正しくありません (例: B2)');
+      return;
+    }
+
+    localStorage.setItem('voiceInputWebAppUrl', webAppUrlInput.value.trim());
+    localStorage.setItem('voiceInputSheetName', sheetNameInput.value.trim());
+    localStorage.setItem('voiceInputSecret', secretInput.value.trim());
+
+    currentCol = parsed.col;
+    currentRow = parsed.row;
+    startRow = parsed.row;
+    isPaused = false;
+    updateCurrentCellDisplay();
+
+    recognition = initRecognition();
+    if (!recognition) return;
+
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    shouldRestart = true;
+
+    recognition.start();
+    setStatus('🎤 聞き取り中... 数字を話してください', true);
+  });
+
+  function stopListening() {
+    shouldRestart = false;
+    pauseForSpeech = false;
+    isPaused = false;
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+    if (recognition) recognition.stop();
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    setStatus('停止しました', false);
+  }
+
+  stopBtn.addEventListener('click', stopListening);
+</script>
+</body>
+</html>
